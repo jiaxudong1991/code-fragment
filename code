@@ -1,0 +1,300 @@
+// 领取任务
+public synchronized void claimTask(String m, String ip, ClaimTaskResponse response) {
+
+        ClaimTaskRequest request = new ClaimTaskRequest();
+        response.setData(m);
+        JSONObject jsonObject = Des3.decode2JSONObject(m, Des3.iv.getBytes());
+
+        String uid = jsonObject.getString("uid");
+        Long scheduleId = jsonObject.getLong("scheduleId");
+        String deviceId = jsonObject.getString("IDFA");
+
+        if (jsonObject.isEmpty() || uid == null || scheduleId == null || deviceId == null) {
+            response.setRet(RetEnum.PARAM_ERROR.getCode());
+            response.setMsg(RetEnum.PARAM_ERROR.getMsg());
+            return;
+        }
+
+        String key = RedisTaskKey.TASK_SCHEDULED_PREFIX + scheduleId;
+
+
+        request.setScheduledId(scheduleId);
+        //获取当前任务计划安排,用来检测是否有剩余
+        TaskScheduled taskScheduled = (TaskScheduled) redisUtil.get(key);
+
+        if (null == taskScheduled) {
+
+            taskScheduled = taskScheduledJpaRepository.findTaskScheduledById(request.getScheduledId());
+
+            if (taskScheduled == null) {
+                response.setRet(RetEnum.SCHEDULE_ERROR.getCode());
+                response.setMsg(RetEnum.SCHEDULE_ERROR.getMsg());
+                return;
+            }
+
+            int time = DateUtil.getTimeDelta(taskScheduled.getEndTime(), new Date());
+
+            if (time > 0) {
+                redisUtil.set(key, taskScheduled, time);
+            } else {
+                // -999 该计划已超过有效期
+                taskScheduled.setId(-999L);
+                redisUtil.set(key, taskScheduled, 86400);
+            }
+        }
+
+        if (taskScheduled.getId() == -999) {
+            response.setRet(RetEnum.SCHEDULE_ERROR.getCode());
+            response.setMsg(RetEnum.SCHEDULE_ERROR.getMsg());
+            return;
+        }
+
+        request.setDeviceId(deviceId);
+        request.setIp(ip);
+        request.setScheduledId(taskScheduled.getId());
+        request.setUserId(uid);
+        request.setTaskId(taskScheduled.getTaskId());
+
+        if (jsonObject.isEmpty()) {
+            response.setRet(RetEnum.PARAM_ERROR.getCode());
+            response.setMsg(RetEnum.PARAM_ERROR.getMsg());
+            return;
+        }
+
+        // get current mission
+        TaskRecord currentTask = this.getCurrentTask(uid);
+
+        // 当前有正在进行的任务 并且和当前任务一致 直接进入到任务详情 不进行处理
+        if (currentTask != null && currentTask.getTaskId().equals(taskScheduled.getTaskId())) {
+
+            // 任务已经超时,放弃任务并删除缓存
+            if (currentTask.getEndTime().getTime() < new Date().getTime()) {
+                response.setRet(RetEnum.TIMEOUT.getCode());
+                response.setMsg(RetEnum.TIMEOUT.getMsg());
+            } else {
+                response.setRet(RetEnum.CONTINUE.getCode());
+                response.setMsg(RetEnum.CONTINUE.getMsg());
+            }
+
+        } else {
+            // 进入领取任务流程
+            checkClaimRules(request, response, currentTask, taskScheduled);
+        }
+    }
+    
+    
+    
+    /**
+     * 获取当前进行中的任务
+     *
+     * @param id 用户id
+     * @return 当前任务状态
+     */
+    @Override
+    public TaskRecord getCurrentTask(String id) {
+
+        if (!StringUtils.isEmpty(id)) {
+
+            String key = RedisTaskKey.CURRENT_TASK_PREFIX + id;
+
+            if (redisUtil.hasKey(key)) {
+                //查看key任务是否超时 而redis没有清除
+                TaskRecord taskRecord = (TaskRecord) redisUtil.get(key);
+                if (taskRecord.getEndTime().getTime() < new Date().getTime()) {
+                    redisUtil.del(key);
+                    return null;
+                }
+                return (TaskRecord) redisUtil.get(key);
+            } else {
+
+                List<TaskRecord> list = taskRecordJpaRepository.findTaskRecordsByUserIdAndSta(id, 0);
+
+                if (null != list) {
+
+                    if (list.size() == 1) {
+                        TaskRecord cur = list.get(0);
+                        if (cur.getEndTime().getTime() > new Date().getTime()) {
+                            redisUtil.set(key, cur, (cur.getEndTime().getTime() - cur.getClaimTime().getTime() / 1000));
+                            return list.get(0);
+                        } else {
+                            TaskRecord record = list.get(0);
+                            record.setSta(3);
+                            taskRecordJpaRepository.save(record);
+                            return null;
+                        }
+                    } else {
+
+                        // current mission is confusion , set all mission status by 2
+                        list.forEach(taskRecord -> taskRecord.setSta(2));
+
+                        taskRecordJpaRepository.saveAll(list);
+                    }
+                }
+                return null;
+            }
+        }
+        return null;
+    }
+    
+    
+    /**
+     * 领取任务规则检测
+     *
+     * @param request
+     * @param response
+     * @param currentTask
+     * @param taskScheduled
+     */
+    private void checkClaimRules(ClaimTaskRequest request, ClaimTaskResponse response, TaskRecord currentTask, TaskScheduled taskScheduled) {
+
+        //如果传入的参数任务id 和 数据库不匹配 则直接返回
+        if (!taskScheduled.getTaskId().equals(request.getTaskId())) {
+            response.setRet(RetEnum.PARAM_ERROR.getCode());
+            response.setMsg(RetEnum.PARAM_ERROR.getMsg());
+            return;
+        }
+
+        String recordKey = RedisTaskKey.SCHEDULE_RECORD_PREFIX + taskScheduled.getId();
+
+        Long size = redisUtil.hlen(recordKey);
+
+        if (size == 0) {
+            // 防止redis数据丢失 0的时候
+            List<TaskRecord> records = taskRecordJpaRepository.findTaskRecordsByTaskIdAndSta(taskScheduled.getTaskId(), 0);
+            size = (long) records.size();
+            if (size > 0) {
+                List<TaskRecord> invalidTask = new ArrayList<>();
+                records.forEach((record) -> {
+                    // 恢复任务剩余时间
+                    int time = DateUtil.getTimeDelta(record.getClaimTime(), new Date());
+
+                    if (time > 0) {
+                        redisUtil.hset(recordKey, currentTask.getUserId(), record, time);
+                    } else {
+                        // 此处也可以不处理 放到定时任务修改
+                        record.setSta(3);
+                        invalidTask.add(record);
+                    }
+                });
+
+                if (invalidTask.size() > 0) {
+                    taskRecordJpaRepository.saveAll(invalidTask);
+                }
+            }
+        }
+
+        // 是否做过当前任务
+        if (redisUtil.hget(recordKey, request.getUserId()) != null) {
+            response.setRet(RetEnum.COMPLETED.getCode());
+            response.setMsg(RetEnum.COMPLETED.getMsg());
+            return;
+        }
+
+        // 当前进行中的任务相同ip数
+        Long count = taskRecordJpaRepository.countTaskRecordsByScheduleIdAndClaimIpAndSta(request.getScheduledId(), request.getIp(), 0);
+
+        TaskGlobalConfig config = (TaskGlobalConfig) redisUtil.get(RedisTaskKey.GLOBAL_CONFIG);
+
+        Integer sameIp = 3;
+        if (config == null) {
+            config = configJpaRepository.getTaskGlobalConfigById(1L);
+            if (config != null) {
+                redisUtil.set(RedisTaskKey.GLOBAL_CONFIG, config);
+                if (config.getAllowSameIp() != null) {
+                    sameIp = config.getAllowSameIp();
+                }
+            }
+        }
+
+        if (count > sameIp) {
+            response.setRet(RetEnum.IP_DUPLICATE.getCode());
+            response.setMsg(RetEnum.IP_DUPLICATE.getMsg());
+            return;
+        }
+
+
+        // 剩余任务数量检测,还有剩余任务,可以进行领取
+        if (taskScheduled.getAmount() > size) {
+
+            Product product = productService.findOne(taskScheduled.getId());
+
+            // 是否实时排重任务
+            if (product.getRealTimeRemoveDuplicate() != null && product.getRealTimeRemoveDuplicate() == 0) {
+                ExcludeRequest excludeRequest = new ExcludeRequest();
+                excludeRequest.setAdid(product.getAdid());
+                excludeRequest.setChannel(product.getChannel());
+                excludeRequest.setIp(request.getIp());
+                excludeRequest.setIdfas(request.getDeviceId());
+                excludeRequest.setCheck(1);
+                excludeRequest.setTaskId(request.getTaskId());
+                // 排重
+                ExcludeService excludeService = (ExcludeService) SpringContextUtil.getBean("excludeService" + taskScheduled.getTaskId());
+                Integer exclude = excludeService.exclude(excludeRequest);
+
+                if (exclude > 0) {
+                    response.setMsg(RetEnum.COMPLETED.getMsg());
+                    response.setRet(RetEnum.COMPLETED.getCode());
+                    return;
+                }
+            }
+
+            // 本地排重
+            if (product.getLocal_remove_duplicate() == 0) {
+                if (taskRecordJpaRepository.countTaskRecordByUserIdAndStaAndClaimIdfaAndTypeAndTaskId(request.getUserId(), 1, request.getDeviceId(), 0, request.getTaskId()) > 0) {
+                    response.setMsg(RetEnum.COMPLETED.getMsg());
+                    response.setRet(RetEnum.COMPLETED.getCode());
+                    return;
+                }
+            }
+
+            // 创建领取任务记录
+            TaskRecord taskRecord = new TaskRecord();
+            taskRecord.setUserId(request.getUserId());
+            taskRecord.setClaimTime(new Date());
+            taskRecord.setClaimPrice(taskScheduled.getPrice());
+            taskRecord.setSta(0);
+            taskRecord.setTaskId(taskScheduled.getTaskId());
+            taskRecord.setTaskType(0);
+            taskRecord.setClaimIp(request.getIp());
+            taskRecord.setClaimKeyWords(taskScheduled.getKeywords());
+            taskRecord.setEndTime(new Date(System.currentTimeMillis() + (taskScheduled.getScheduleTime() * 1000 * 60)));
+            taskRecord.setScheduleId(request.getScheduledId());
+            taskRecord.setClaimIdfa(request.getDeviceId());
+            taskRecord.setCallback(0);
+
+            // 一起处理新领取任务和放弃原来的任务
+            if (currentTask != null) {
+                // 先清除之前的任务缓存,保证不占用任务领取数
+                redisUtil.hdel(RedisTaskKey.SCHEDULE_RECORD_PREFIX + currentTask.getScheduleId(), currentTask.getUserId());
+
+                List<TaskRecord> taskRecords = new ArrayList<>();
+                taskRecords.add(taskRecord);
+                currentTask.setSta(2);
+                taskRecords.add(currentTask);
+                taskRecordJpaRepository.saveAll(taskRecords);
+            } else {
+                taskRecordJpaRepository.save(taskRecord);
+            }
+            response.setRet(RetEnum.SUCCESS.getCode());
+            response.setMsg(RetEnum.SUCCESS.getMsg());
+
+            redisUtil.hset(recordKey, request.getUserId(), taskRecord, taskScheduled.getScheduleTime() * 60);
+
+            int time = DateUtil.getTimeDelta(new Date(), taskScheduled.getEndTime());
+
+            String currentTaskKey = RedisTaskKey.CURRENT_TASK_PREFIX + request.getUserId();
+
+            if (time < (taskScheduled.getScheduleTime() * 60) && time > 0) {
+                redisUtil.set(currentTaskKey, taskRecord, time);
+            } else {
+                redisUtil.set(currentTaskKey, taskRecord, taskScheduled.getScheduleTime() * 60);
+            }
+
+            claimTaskLogger.info(taskRecord.getUserId() + "\t" + taskRecord.getId() + "\t" + taskRecord.getScheduleId() + "\t" + taskRecord.getClaimIp() + "\t" + taskRecord.getClaimIdfa() + "\t" + new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(taskRecord.getClaimTime()));
+        } else {
+            //任务已经达到目标
+            response.setRet(RetEnum.FINISH.getCode());
+            response.setMsg(RetEnum.FINISH.getMsg());
+        }
+
+    }
